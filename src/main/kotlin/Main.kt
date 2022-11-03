@@ -3,6 +3,7 @@ import androidx.compose.material.MaterialTheme
 import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.Button
@@ -14,13 +15,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.yield
 import org.slf4j.LoggerFactory
 import org.slf4j.event.Level
 import java.nio.file.*
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 import kotlin.io.path.fileSize
 import kotlin.io.path.listDirectoryEntries
 
@@ -97,7 +97,13 @@ data class FSRoots(
 	fun split(possiblyStaleEntry: FSDirectory): FSRoots {
 		val entry = roots
 			.filterIsInstance<FSDirectory>()
-			.first { it.path == possiblyStaleEntry.path }
+			.firstOrNull() { it.path == possiblyStaleEntry.path }
+		if (entry == null) {
+			log(Level.WARN) {
+				"Tried to split element $possiblyStaleEntry when no such entry exists in the roots."
+			}
+			return this
+		}
 		if (entry.children.isEmpty()) {
 			return this
 		}
@@ -232,7 +238,9 @@ fun cFileSystemEntry(entry: FileSystemEntry, ignoreCallback: () -> Unit, splitCa
 @Preview
 fun cApp(roots: FSRoots, ignoreCallback: (FileSystemEntry) -> Unit, splitCallback: (FileSystemEntry) -> Unit) {
 	MaterialTheme {
-		LazyColumn {
+		LazyColumn(
+			modifier = Modifier.fillMaxWidth()
+		) {
 			for (root in roots.roots) {
 				item(key = root.path) {
 					cFileSystemEntry(root, ignoreCallback = { ignoreCallback(root) }, splitCallback = { splitCallback(root) })
@@ -242,8 +250,65 @@ fun cApp(roots: FSRoots, ignoreCallback: (FileSystemEntry) -> Unit, splitCallbac
 	}
 }
 
+sealed interface FSRootsCommands
+data class Ignore(val entry: FileSystemEntry): FSRootsCommands {
+	override fun toString(): String {
+		return "Ignore(${entry.path})"
+	}
+}
+data class Split(val dir: FSDirectory): FSRootsCommands {
+	override fun toString(): String {
+		return "Split(${dir.path})"
+	}
+}
+
+private fun startStateManager(
+	initialFSRoots: FSRoots,
+	composeToIo: Channel<FSRootsCommands>,
+	ioToCompose: Channel<FSRoots>,
+	ioToStateMan: Channel<Pair<FSRoots, FSRoots>>,
+	stateManToIo: Channel<FSRoots>
+) {
+	GlobalScope.launch(Dispatchers.Default) {
+		var roots = initialFSRoots
+		stateManToIo.send(roots)
+		while (true) {
+			log(Level.DEBUG) { "new Update loop..." }
+			val command = composeToIo.tryReceive().getOrNull()
+			if (command != null) {
+				log(Level.INFO) { "Processing command $command" }
+				roots = when (command) {
+					is Ignore -> roots.ignore(command.entry)
+					is Split -> roots.split(command.dir)
+				}
+				ioToCompose.send(roots)
+			}
+			val ioUpdate = ioToStateMan.tryReceive().getOrNull()
+			if (ioUpdate != null) {
+				if (ioUpdate.first == roots) {
+					roots = ioUpdate.second
+					ioToCompose.send(roots)
+				} else {
+					log(Level.INFO) { "Discarding stale IO update." }
+				}
+				stateManToIo.send(roots)
+			}
+		}
+	}
+}
+
+fun startIo(stateManToIo: Channel<FSRoots>, ioToStateMan: Channel<Pair<FSRoots, FSRoots>>) {
+	GlobalScope.launch(Dispatchers.IO) {
+		while (true) {
+			log(Level.DEBUG) { "new IO loop..." }
+			val rootToUpdate = stateManToIo.receive()
+			ioToStateMan.send(Pair(rootToUpdate, rootToUpdate.updateOneStep()))
+		}
+	}
+}
+
 fun main(args: Array<String>) {
-	val roots: List<Path> = when (args.size) {
+	val rootsFromArgs: List<Path> = when (args.size) {
 		0 -> {
 			val curDirectory = Paths.get("").toRealPath()
 			curDirectory.listDirectoryEntries()
@@ -258,50 +323,37 @@ fun main(args: Array<String>) {
 			args.map { Paths.get(it).toRealPath() }
 		}
 	}
-	log(Level.INFO) { "Analyzing roots $roots ..." }
+	log(Level.INFO) { "Analyzing roots $rootsFromArgs ..." }
+
+	val initialFSRoots = FSRoots(rootsFromArgs.mapNotNull { pathToEntry(it) }.sortedByDescending { it.size })
+	var stateManToIo = Channel<FSRoots>()
+	var ioToStateMan = Channel<Pair<FSRoots, FSRoots>>()
+	var stateManToCompose = Channel<FSRoots>()
+	var composeToStateMan = Channel<FSRootsCommands>(100)
+
+	startStateManager(initialFSRoots, composeToStateMan, stateManToCompose, ioToStateMan, stateManToIo)
+	startIo(stateManToIo, ioToStateMan)
 
 	application {
-		val rootsLock = ReentrantLock()
-		var composeRoots by remember {
-			mutableStateOf(FSRoots(roots.mapNotNull { pathToEntry(it) }.sortedByDescending { it.size }))
-		}
+		var composeRoots by remember { mutableStateOf(initialFSRoots) }
+		val scope = rememberCoroutineScope()
 		Window(onCloseRequest = ::exitApplication) {
 			cApp(composeRoots, ignoreCallback = {
-				rootsLock.withLock {
-					composeRoots = composeRoots.ignore(it)
+				scope.launch {
+					composeToStateMan.send(Ignore(it))
 				}
 			}, splitCallback = {
 				if (it is FSDirectory) {
-					logger.info("START split; waiting on lock old size = ${composeRoots.roots.size}")
-					rootsLock.withLock {
-						logger.info("MIDDLE split; got lock, executing algo, old size = ${composeRoots.roots.size}")
-						composeRoots = composeRoots.split(it)
-						logger.info("MIDDLE split; done algo, releasing lock, new size = ${composeRoots.roots.size}")
+					scope.launch {
+						composeToStateMan.send(Split(it))
 					}
-					logger.info("DONE split; new size = ${composeRoots.roots.size}")
 				} else {
 					//do nothing
 				}
 			})
-		}
-
-		LaunchedEffect(composeRoots) {
-			launch(Dispatchers.IO) {
+			scope.launch {
 				while (true) {
-					log(Level.DEBUG) { "new Update loop..." }
-					//logger.info("START loop Waiting for rootsLock to loop")
-					val beforeLock = System.currentTimeMillis()
-					val beforeAlgo: Long
-					rootsLock.withLock {
-						beforeAlgo = System.currentTimeMillis()
-						composeRoots = composeRoots.updateOneStep()
-					}
-					val after = System.currentTimeMillis()
-					if (after - beforeLock > 1000) {
-						logger.warn("Held roots lock for more than 1 second: waiting on lock: ${beforeAlgo - beforeLock}, running algo: ${after - beforeAlgo}, total: ${after - beforeLock}")
-					}
-					//logger.info("DONE loop Waiting for rootsLock to loop")
-					yield()
+					composeRoots = stateManToCompose.receive()
 				}
 			}
 		}
